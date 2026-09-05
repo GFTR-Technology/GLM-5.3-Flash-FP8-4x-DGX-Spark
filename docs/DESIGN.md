@@ -1,0 +1,114 @@
+# Design choices, failures, and the CUDA-graph fix
+
+This is the 4× Spark FP8 recipe. Tony's 2× Spark NVFP4 work is what made GB10 even possible. We took his SM121 image layers, kept native FP8 + DeepGEMM, and ran occupancy lanes on four boxes.
+
+## The model
+
+GLM-5.3 Flash is `Glm5NextForConditionalGeneration`: 320B / 18B-active, hybrid KDA + sparse MLA, **NoPE** (`qk_rope_head_dim=0`). Native FP8, `decode_context_parallel_size=1`. This recipe serves it as-is — no grafted kernels from other checkpoints.
+
+## Weights: FP8, not NVFP4
+
+NVFP4 on GB10 is a Marlin dequant path, not native FP4 tensor cores. Smaller on disk, usually slower at decode. `dealignai/GLM-5.3-Flash-UNCENSORED-FP8` is the card this recipe serves.
+
+## Stock image does not boot on GB10
+
+`vllm/vllm-openai:glm53-flash-arm64-cu130` resolves `FLASHINFER_MLA_SPARSE_SM120`, which hard-wires `fp8_ds_mla` and asserts `pe_dim == 64` (DeepSeek rope). GLM-5.3 has `pe_dim=0`. Result: 62/62 shards load, then die in KV init.
+
+Forcing any other sparse backend: `compute capability not supported`. There is no CLI way out.
+
+Tony's layered Dockerfiles extend the SM90 **NoPE** sparse-MLA backend (plain cache, not `fp8_ds_mla`) to SM121, bump FlashInfer to 0.6.18 (0.6.17 FA2 NaNs on SM121), re-pin NCCL 2.30.7 and cutlass-dsl 4.6.2 (the FlashInfer pip silently downgrades both), and gate PDL off on SM12x. We skip his NaN-debug v2 layer. Dockerfiles live in `docker/` and are his; credit in the README.
+
+After that image, attention is `FLASHINFER_MLA_SPARSE_SM90`. KV is `fp8_e4m3`. MoE is DeepGEMM FP8. `--block-size 2304` is required for the SM121 DeepGEMM kpool.
+
+## Official ENTRYPOINT is already `vllm serve`
+
+If you pass `vllm serve` again you double the command and the container exits immediately. The GID wrapper is `--entrypoint`. Args start with `vllm serve /model ...`.
+
+## CUDA graphs: the fix
+
+Tony's 5.3 recipe stays on `--enforce-eager` and lists graphs as backlog.
+
+Dropping `--enforce-eager` here died later, at KV profile:
+
+```
+launch_persistent_topk ... FilteredTopK fallback requires >=128KB smem
+```
+
+GB10 SMEM is **101,376 B**. Hopper-shaped top-k wants 128 KB. Eager never launched that kernel. Graphs did.
+
+Same class of bug as Tony's fp8-KV CTA tile (Hopper 32 / 228 KB vs GB10 16 / 101 KB).
+
+Fix: skip `persistent_topk` on SM12x, fall back to `top_k_per_row_decode`. Bind-mounts:
+
+- `patches/sparse_attn_indexer.py`
+- `patches/sparse_attn_indexer_kpool.py`
+
+plus `VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0`. After that, capture completed: PIECEWISE 8/8, FULL 3/3, plus speculator graphs. `--async-scheduling` stays on.
+
+Tiny-prompt E2E went from ~2.4 s (eager) to ~1.3 s (graphs). Single-stream decode ~30 tok/s tiny, ~43 tok/s after a ~50k prefill.
+
+## Occupancy lanes, not peak-full-window
+
+At `gmu=0.85` the engine prints ~2.1–2.4M KV tokens. Full-window math:
+
+| Lane | seqs × ctx | Engine print (this hardware) |
+|---|---|---|
+| 200k | 15 × 200K | ~11× at 200K (not 15 full windows) |
+| 500k | 5 × 500K | ~4.7× at 500K |
+| 1m | 3 × 1M | **2.15× at 1M** |
+
+We still ship `seqs=15/5/3` because real traffic is mixed occupancy: five full parallel 200K jobs would preempt; they almost never arrive that way.
+
+`max-model-len` for the 1M lane is **1,000,000**, not 1,048,576. Native max is 1,048,576; at 0.85 that print is 2.87×, so "3 @ 1M" would be a lie.
+
+Default gmu stays 0.85 so a box that still has a desktop session does not OOM rank 0 (API + EngineCore live there, ~5 GB extra vs workers). Squeeze `0.885` is documented for stripped OS. 0.89+ is how you get `NV_ERR_NO_MEMORY` on the head.
+
+## Decode stack (order we turned things on)
+
+1. SM121 NoPE image (required to boot)
+2. 5 × 500K occupancy (daily)
+3. MTP **k=3** — measured. The k=3/k=4 A/B (full battery, 2026-08-28) showed k=4's 4th
+   draft token rejects: vLLM per-position acceptance `0.88/0.80/0.74/0.49` — position 4
+   costs more than it earns (−46% decode on reasoning c=1, −24% mean c1–5). Tony's TP4
+   runs k=4 under `--enforce-eager`, a different regime.
+3b. **DFlash2 — next roadmap item, not yet wired.** Inco's block-diffusion drafter
+   (`incoai/GLM-5.3-Flash-DFlash2`, ~800 MB) drafted for exactly this model: +3–27%
+   acceptance over MTP at k=7-block (GSM8K 5.78 vs 5.06, HumanEval 5.32 vs 4.70),
+   ≈1.3–1.7× MTP throughput at c=1, decays with concurrency. Ships **SGLang-only**
+   (a bespoke PR, not vLLM speculative-cfg). Wire-up = move engines or port drafter;
+   above MTP-3 but a separate daily-driver decision.
+   → Not a "faster than us" datapoint: their 40–50+ tok/s is on **GB300/NCU TP4**
+   with TRT-LLM kernels, different hardware class than 4× Spark.
+4. `--max-num-batched-tokens 8192` (4096 is too small with MTP draft slots)
+5. Drop eager, add async-scheduling, bind-mount the SMEM patch
+
+Not used: DCP, DeepEP (duplicate NCCL, failed import), NVFP4+Marlin, InstantTensor.
+
+## Tensor parallel sizes that do not divide the model
+
+TP=4 is free: 64 MLA heads, 64 KDA heads, 32 indexer heads and the 2048 MoE
+intermediate all divide by 4. TP=6 divides none of them, and the 154880 vocab
+does not either — vLLM's `pad_vocab_size` rounds to 64 and ignores `tp_size`,
+so `divide(154880, 6)` asserts before attention is even reached.
+
+We pad instead of repacking: heads 64→66, indexer 32→36, MoE 2048→2304, vocab
+→154944, applied to the weight stream as it loads. Column-parallel weights get a
+cyclic copy of real heads; row-parallel weights get zeroed padded columns. The
+zeros cancel the padded units' contribution; the copies keep the activations
+feeding `o_proj`/`down_proj` free of all-zero 128-blocks, which DeepGEMM's
+dynamic per-block FP8 quantisation would turn into 0/0.
+
+Costs ~6 GiB per rank (the MoE is ~95% of the model and grows 12.5%); TP=6 still
+frees ~19 GiB per rank versus TP=4. MLA replicates its KV latent per rank, so
+the KV pool grows with the freed weight memory, not with the TP count.
+
+Full writeup, including what the vision tower still needs verified on-image:
+[docs/TP6.md](TP6.md).
+
+## Multimodal
+
+Vision + video towers load. Encoder cache ~32k tokens, profiled with 1 video item. Image (1280×640 PNG) and a 17s 1080p MP4 both returned real content (product name, badges, CLI commands). MTP drafter does not take vision embeddings.
+
+## Clock wedge
+
+A GB10 can report P0 and sit at ~660 MHz. One wedged rank gates TP=4. Warm reboot does not always clear it. The serve script burns 5s per node before launch.
