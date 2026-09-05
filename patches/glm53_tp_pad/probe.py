@@ -123,11 +123,13 @@ def section_greps(root: str, files: list[str]) -> None:
 
 
 def section_vision(root: str, files: list[str]) -> None:
-    _print_header("vision tower — the one dimension set we could not pre-decide")
+    _print_header("vision tower — hosted whole per rank, never padded")
     print("  hidden 1024 / heads 16 / mlp 4096 / merger 10240: none divide by 6.")
-    print("  If the tower uses parallel linears AND does not support encoder DP,")
-    print("  --mm-encoder-tp-mode data silently falls back to 'weights' and TP=6")
-    print("  will still fail here. Look for parallel linears in the files below.\n")
+    print("  Nothing pads these, so --mm-encoder-tp-mode data is the only way")
+    print("  through, and vLLM only grants that mode to a model class that")
+    print("  declares supports_encoder_tp_data. Baseline: the tower honours the")
+    print("  mode (7 linears with disable_tp=use_data_parallel) but does not")
+    print("  declare it, so the shim declares it on the class's behalf.\n")
     vision_files = [f for f in files if re.search(r"vis|vit|image", f, re.IGNORECASE)]
     if not vision_files:
         vision_files = files
@@ -257,19 +259,68 @@ def section_encoder_dp_gate(root: str) -> None:
     print(
         "\n  Read for: a line that resets mm_encoder_tp_mode to 'weights' when the\n"
         "  model class lacks supports_encoder_tp_data. If it exists, the shim's\n"
-        "  patch_encoder_dp is load-bearing; if not, it is a harmless no-op."
+        "  patch_encoder_dp is load-bearing; if not, it is a harmless no-op.\n"
+        "\n  The gate WAS present when this shim was written:\n"
+        "    interfaces.py  supports_encoder_tp_data: ClassVar[bool] = False\n"
+        "    interfaces.py  return getattr(model, 'supports_encoder_tp_data', False)\n"
+        "    config/model.py    mm_encoder_tp_mode = 'weights'   <- the downgrade\n"
+        "  It is evaluated in ModelConfig, from a registry inspection vLLM runs in\n"
+        "  a subprocess whose output is discarded — so a failure shows up as vLLM's\n"
+        "  own fallback warning, not as a missing [glm53-tp-pad] line."
     )
+
+
+def section_hooks() -> None:
+    """Do the shim's hook module names exist in this image?
+
+    ``sitecustomize`` patches by module name, and names that never resolve never
+    fire — silently. That is survivable for the loader seams (there are two
+    alternatives and the padding would visibly not happen), but not for
+    ``patch_encoder_dp``: if its module name is wrong the marker is never set,
+    vLLM quietly downgrades the encoder to weight sharding, and the failure
+    surfaces a long way from the cause.
+    """
+    _print_header("shim hook targets")
+    shim = _import_shim()
+    if shim is None:
+        return
+    encoder_targets = 0
+    for name, fn in shim.HOOKS.items():
+        try:
+            found = importlib.util.find_spec(name) is not None
+        except (ImportError, AttributeError, ValueError):
+            found = False
+        is_encoder = fn is shim.patch_encoder_dp
+        if found and is_encoder:
+            encoder_targets += 1
+        print(f"  {'ok     ' if found else 'absent '} {name}  -> {fn.__name__}")
+    if not encoder_targets:
+        print(
+            "\n  NO module resolved for patch_encoder_dp. The glm5next drop moved;\n"
+            "  add its real module name to HOOKS in glm53_tp_pad.py or the vision\n"
+            "  tower will shard at TP=6. (Derive it from the file list above:\n"
+            "  models/glm5next/nvidia/model.py -> vllm.models.glm5next.nvidia.model)"
+        )
+    else:
+        print(f"\n  {encoder_targets} encoder-DP hook target(s) resolve — the marker will be set.")
 
 
 def section_sitecustomize() -> None:
     _print_header("sitecustomize collisions")
     found = []
+    seen = set()
     for entry in sys.path:
         if not entry:
             continue
         candidate = os.path.join(entry, "sitecustomize.py")
-        if os.path.isfile(candidate):
-            found.append(candidate)
+        if not os.path.isfile(candidate):
+            continue
+        # Two sys.path entries can name the same file; that is not a collision.
+        key = os.path.realpath(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        found.append(candidate)
     if not found:
         print("  none — our PYTHONPATH copy will be the only one")
     for path in found:
@@ -278,13 +329,27 @@ def section_sitecustomize() -> None:
         print("  >1 found: sitecustomize.py chain-loads the others, verify the order")
 
 
-def section_plan(tp: int) -> None:
-    _print_header(f"padding plan for TP={tp}")
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+def _import_shim():
+    """Import glm53_tp_pad from next to this file, or explain why not."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    # Not unconditionally: in the container /opt/glm53 is already on sys.path via
+    # PYTHONPATH, and a duplicate entry would make section_sitecustomize report a
+    # collision with itself.
+    if here not in sys.path:
+        sys.path.insert(0, here)
     try:
         import glm53_tp_pad
+
+        return glm53_tp_pad
     except Exception as exc:
         print(f"  glm53_tp_pad not importable: {exc}")
+        return None
+
+
+def section_plan(tp: int) -> None:
+    _print_header(f"padding plan for TP={tp}")
+    glm53_tp_pad = _import_shim()
+    if glm53_tp_pad is None:
         return
     plan = glm53_tp_pad.plan_for_tp(tp)
     print(f"  active: {plan.active}")
@@ -318,6 +383,7 @@ def main() -> int:
     section_vision(root, files)
     section_seams()
     section_encoder_dp_gate(root)
+    section_hooks()
     section_sitecustomize()
     section_plan(args.tp)
     print(f"\n{SECTION}\nprobe complete — nothing was modified\n{SECTION}")

@@ -681,15 +681,32 @@ def patch_encoder_dp(module) -> bool:
     None of those divide by 6 and none of them is padded here — the tower is not
     part of any pad group, so hosting the encoder whole on every rank is the only
     way through. The implementation already does exactly that when asked:
-    ``use_data_parallel`` (set from ``mm_encoder_tp_mode == "data"``) forces the
-    tower's ``tp_size`` to 1 and passes ``disable_tp=True`` to every vision
-    linear. What it never does is set the ``supports_encoder_tp_data`` marker
-    that vLLM checks before it grants the mode — without it the request is
-    silently downgraded to ``weights`` and the tower shards anyway, straight into
-    ``divide(16, 6)``.
+    ``is_vit_use_data_parallel()`` (read from the resolved
+    ``mm_encoder_tp_mode``) forces the tower's ``tp_size`` to 1 and passes
+    ``disable_tp=True`` to every vision linear. What it never does is set the
+    ``supports_encoder_tp_data`` marker that vLLM checks before it grants the
+    mode — without it the request is silently downgraded to ``weights`` and the
+    tower shards anyway, straight into ``divide(16, 6)``.
+
+    The gate is confirmed present in this image::
+
+        model_executor/models/interfaces.py:152  supports_encoder_tp_data: ClassVar[bool] = False
+        model_executor/models/interfaces.py:545  return getattr(model, "supports_encoder_tp_data", False)
+        config/model.py:764                      mm_encoder_tp_mode == "data"
+        config/model.py:771                      mm_encoder_tp_mode = "weights"
+
+    so this patch is load-bearing, not decorative. Note *where* it has to take
+    effect: the downgrade is decided in ``ModelConfig.__post_init__`` from a
+    registry inspection vLLM runs in a subprocess, not in the ranks. That
+    subprocess inherits ``PYTHONPATH`` and ``GLM53_TP_PAD`` from the container,
+    so ``site`` loads our ``sitecustomize`` there too and the hook fires when it
+    imports the model module — but its stderr is captured and dropped, so the
+    log line below will only ever be visible from the ranks. If vLLM warns about
+    falling back from ``--mm-encoder-tp-mode data``, this patch did not reach the
+    inspecting process.
 
     Setting the marker is a statement about the model, not a behaviour change:
-    if vLLM's build has no such gate the attribute is simply unused.
+    on a build with no such gate the attribute is simply unused.
     """
     plan = _state.get("plan") or _env_plan()
     if plan is None:

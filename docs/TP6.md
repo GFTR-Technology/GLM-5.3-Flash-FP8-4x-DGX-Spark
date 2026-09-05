@@ -53,15 +53,39 @@ against 32 rows of unpadded weight and loading would fail a shape check. Hence
 `index_n_heads` at 32. (The implementation already carries its own head-count
 fixup at `attention.py:394` for checkpoints that ship `index_n_heads=16`.)
 
-**The vision tower supports encoder DP but never declares it.** The tower
-honours the mode correctly — `multimodal.py:141` sets `tp_size = 1` under DP and
-every vision linear is built `disable_tp=use_data_parallel` — but no file in the
-implementation contains `supports_encoder_tp_data`. If vLLM core gates the mode
-on that class attribute, `--mm-encoder-tp-mode data` is downgraded to `weights`
-and the 16-head tower dies in `divide(16, 6)`. So the shim sets the marker on
-the `*ForConditionalGeneration` class (`patch_encoder_dp`), which is a harmless
-no-op if no such gate exists. The probe's `encoder-DP gate in vLLM core` section
-prints whether it does.
+**The vision tower supports encoder DP but never declares it — and the gate is
+real.** The tower honours the mode correctly: `multimodal.py:141` sets
+`tp_size = 1` under DP and seven vision linears are built
+`disable_tp=use_data_parallel`. But `use_data_parallel` comes from
+`is_vit_use_data_parallel()` (`multimodal.py:54,101,140,310,375`), a helper that
+reads the *resolved* config — and no file in the implementation contains
+`supports_encoder_tp_data`. vLLM core does gate on that attribute:
+
+```
+model_executor/models/interfaces.py:152  supports_encoder_tp_data: ClassVar[bool] = False
+model_executor/models/interfaces.py:545  return getattr(model, "supports_encoder_tp_data", False)
+config/model.py:764                      mm_encoder_tp_mode == "data"
+config/model.py:771                      mm_encoder_tp_mode = "weights"
+config/multimodal.py:179                 mm_encoder_tp_mode: MMEncoderTPMode = "weights"
+```
+
+So without the marker, `--mm-encoder-tp-mode data` is resolved back to
+`"weights"` in `ModelConfig`, `is_vit_use_data_parallel()` returns False in every
+worker, and the 16-head tower shards into `divide(16, 6)` at
+`multimodal.py:150`. The shim sets the marker on the
+`*ForConditionalGeneration` class (`patch_encoder_dp`). This is the one piece of
+the shim that is not padding at all, and it is required.
+
+**Where the marker has to be set is not where you see it.** The downgrade is
+decided in `ModelConfig.__post_init__`, from a registry inspection that vLLM
+runs in a **subprocess** (`python -m vllm.model_executor.models.registry`) whose
+output is captured and discarded unless it fails. The shim reaches that
+subprocess because it inherits `PYTHONPATH=/opt/glm53` and `GLM53_TP_PAD` from
+the container environment, so `site` loads `sitecustomize.py` there too and the
+import hook fires when the subprocess imports the model module. You will not see
+the shim's `supports_encoder_tp_data=True` line from that process — only from
+the ranks. The signal that it *failed* is vLLM's own fallback warning about
+`--mm-encoder-tp-mode` during start-up.
 
 ### `head_dim` is pinned when the MLA group is on
 
@@ -159,10 +183,11 @@ WORKER_IPS="10.0.0.12 10.0.0.13 10.0.0.14 10.0.0.15 10.0.0.16"
      a dimension this shim does not know about.
    * **indexer** — if `wk_weights_proj` is no longer `disable_tp=True`, it *is*
      sharded and you need `GLM53_TP_PAD_GROUPS=mla,kda,indexer,moe,vocab`.
-   * **vision tower** — the `encoder-DP gate in vLLM core` section says whether
-     core downgrades `--mm-encoder-tp-mode data` for a class that lacks
-     `supports_encoder_tp_data`. If it does, `patch_encoder_dp` is load-bearing
-     and the debug log must show it firing.
+   * **vision tower** — the `encoder-DP gate in vLLM core` section should still
+     show `interfaces.py: supports_encoder_tp_data` and the
+     `config/model.py: mm_encoder_tp_mode = "weights"` downgrade. As long as it
+     does, `patch_encoder_dp` is load-bearing and `--mm-encoder-tp-mode data`
+     alone is not enough.
    * do `DefaultModelLoader._get_weights_iterator` and `pad_vocab_size` exist?
      (`vllm.model_executor.model_loader.loader` reported absent is fine — it is
      the pre-0.9 fallback seam.)

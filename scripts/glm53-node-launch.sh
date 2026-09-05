@@ -87,13 +87,15 @@ fi
 # and nothing pads them — hosting the encoder whole on every rank is the only way
 # through. The probe confirmed the tower honours this (tp_size=1 and disable_tp
 # on every vision linear when use_data_parallel is set) but never declares
-# `supports_encoder_tp_data`, so the shim sets that marker; without both the
-# flag and the marker vLLM downgrades to weight-sharding and dies in divide(16,6).
+# `supports_encoder_tp_data`, and that vLLM core really does gate on the marker
+# (config/model.py resets the mode to "weights" without it). The shim sets the
+# marker; this flag asks for the mode. Both are required.
 # Set empty to omit the flag entirely (older vLLM that rejects the option).
 MM_ENCODER_TP_MODE="${GLM53_MM_ENCODER_TP_MODE-data}"
 if [ "$PAD_ACTIVE" = 1 ] && [ -z "$MM_ENCODER_TP_MODE" ]; then
-  printf '\033[33m! GLM53_MM_ENCODER_TP_MODE is empty at TP=%s — the vision tower will\n' "$TP" >&2
-  printf '  shard and assert unless this vLLM defaults to encoder DP.\033[0m\n' >&2
+  printf '\033[33m! GLM53_MM_ENCODER_TP_MODE is empty at TP=%s — vLLM defaults the mode\n' "$TP" >&2
+  printf '  to "weights", so the vision tower will shard and assert in divide(16,%s).\n' "$TP" >&2
+  printf '  Only do this on a vLLM too old to accept the flag.\033[0m\n' >&2
 fi
 
 DRYRUN=0; STOP=0
