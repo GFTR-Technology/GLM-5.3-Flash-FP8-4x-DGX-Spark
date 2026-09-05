@@ -3,28 +3,73 @@
 The published recipe is TP=4. This page is what it takes to run a tensor
 parallel size that does **not** divide the model, TP=6 in particular.
 
-Short version: it is not only the attention heads. Six independent dimensions
-break, and one of them (the vocab) has nothing to do with attention at all.
+Short version: it is not only the attention heads. Four dimensions get padded,
+one is handled by hosting a whole copy per rank, and one of the padded four (the
+vocab) has nothing to do with attention at all.
 
 ## What breaks at TP=6
 
 Values are from the shipped checkpoint — `config.json` and the safetensors
-headers of `dealignai/GLM-5.3-Flash-UNCENSORED-FP8`.
+headers of `dealignai/GLM-5.3-Flash-UNCENSORED-FP8`. The "sharded?" column is
+from `scripts/glm53-tp-probe.sh` run against the real image, not from reading
+the config: a dimension only has to divide if this build actually splits it.
 
-| Dimension | Config key | Value | ÷6 | Padded to | Per rank |
-|---|---|---|---|---|---|
-| MLA heads (11 layers + MTP) | `num_attention_heads` | 64 | ✗ | **66** | 11 |
-| Sparse indexer heads | `index_n_heads` | 32 | ✗ | **36** | 6 |
-| KDA heads (34 layers) | `linear_attn_config.num_heads` | 64 | ✗ | **66** | 11 |
-| MoE expert intermediate | `moe_intermediate_size` | 2048 | ✗ | **2304** | 384 |
-| Vocabulary | `vocab_size` | 154880 | ✗ | **154944** | 25824 |
-| Vision tower | `vision_config.*` | 1024 / 16 / 4096 | ✗ | encoder DP | — |
-| Dense MLP (first 3 layers) | `intermediate_size` | 12288 | ✓ | — | 2048 |
-| Routed experts | `n_routed_experts` | 288 | ✓ | — | — |
+| Dimension | Config key | Value | ÷6 | Sharded? | Fix | Per rank |
+|---|---|---|---|---|---|---|
+| MLA heads (11 layers + MTP) | `num_attention_heads` | 64 | ✗ | yes | pad **66** | 11 |
+| KDA heads (34 layers) | `linear_attn_config.num_heads` | 64 | ✗ | yes | pad **66** | 11 |
+| MoE expert intermediate | `moe_intermediate_size` | 2048 | ✗ | yes | pad **2304** | 384 |
+| Vocabulary | `vocab_size` | 154880 | ✗ | yes | pad **154944** | 25824 |
+| Sparse indexer heads | `index_n_heads` | 32 | ✗ | **no** (`disable_tp`) | nothing | 32 |
+| Vision tower | `vision_config.*` | 1024 / 16 / 4096 | ✗ | opt-out | encoder DP | whole |
+| Dense MLP (first 3 layers) | `intermediate_size` | 12288 | ✓ | yes | — | 2048 |
+| Routed experts | `n_routed_experts` | 288 | ✓ | yes | — | — |
 
 The padded extents keep blockwise-FP8 alignment: MLA head dim is 256 and KDA's
 is 128, so head padding is automatically a multiple of 128; the MoE intermediate
 rounds to a multiple of `tp * 128` (2304 / 6 = 384 = 3 × 128).
+
+### Two things the probe settled
+
+Both were open when this shim was written and neither is answerable from the
+config; the model code in this image is a custom drop, so the probe is the only
+authority. Re-run it after any image bump — these are properties of the *build*,
+not of the checkpoint.
+
+**The sparse indexer is not TP-sharded, so it is not padded.** Its only parallel
+module is built with `disable_tp=True`:
+
+```
+models/glm5next/nvidia/attention.py:259  self.wk_weights_proj = MergedColumnParallelLinear(
+                                     ...  disable_tp=True)
+```
+
+All 32 heads therefore live whole on every rank and never reach `divide()`.
+The probe's `[tp-divide]` sweep confirms this from the other side: five call
+sites, all in `kda.py` and `multimodal.py`, none in the indexer. Padding it
+anyway would be worse than pointless — the config would advertise 36 heads
+against 32 rows of unpadded weight and loading would fail a shape check. Hence
+`indexer` is *not* in `DEFAULT_GROUPS` and `make_overlay.py` leaves
+`index_n_heads` at 32. (The implementation already carries its own head-count
+fixup at `attention.py:394` for checkpoints that ship `index_n_heads=16`.)
+
+**The vision tower supports encoder DP but never declares it.** The tower
+honours the mode correctly — `multimodal.py:141` sets `tp_size = 1` under DP and
+every vision linear is built `disable_tp=use_data_parallel` — but no file in the
+implementation contains `supports_encoder_tp_data`. If vLLM core gates the mode
+on that class attribute, `--mm-encoder-tp-mode data` is downgraded to `weights`
+and the 16-head tower dies in `divide(16, 6)`. So the shim sets the marker on
+the `*ForConditionalGeneration` class (`patch_encoder_dp`), which is a harmless
+no-op if no such gate exists. The probe's `encoder-DP gate in vLLM core` section
+prints whether it does.
+
+### `head_dim` is pinned when the MLA group is on
+
+`Glm5NextTextConfig` derives `head_dim` from `hidden_size // num_attention_heads`
+when the key is absent, so bumping 64 → 66 would silently drag head_dim 64 → 62.
+This checkpoint ships `head_dim` explicitly (as `0` — MLA uses `qk_nope_head_dim`
+and `v_head_dim` instead), so nothing moves today. `make_overlay.py` writes the
+pre-pad value anyway if a future release drops the key.
 
 ### The vocab is a separate blocker
 
@@ -64,6 +109,8 @@ the *combining* weight for the per-head index logits. It is semantically an
 output-side tensor, so padded heads are zeroed there — otherwise they would
 perturb the top-k token selection. (Any uniform positive rescale of the index
 logits is harmless because top-k is scale invariant; a *contribution* is not.)
+This rule is kept and tested but does not fire by default, because the indexer
+turned out not to be sharded; it exists for a build that starts sharding it.
 
 FP8 `weight_scale_inv` companions follow their weight: replicated where the
 weight is replicated, filled with **1.0** where it is zeroed. The quantised
@@ -98,20 +145,27 @@ WORKER_IPS="10.0.0.12 10.0.0.13 10.0.0.14 10.0.0.15 10.0.0.16"
 ```
 
 1. **Probe the image first.** The glm5next implementation in this image is a
-   custom drop; the shim's attachment points need confirming once.
+   custom drop, and the defaults above were chosen from one probe run against
+   one image. Re-confirm after any image bump.
 
    ```bash
    ./scripts/glm53-tp-probe.sh          # read-only, safe while an engine is live
    ```
 
-   Read three things out of the report:
-   * does the **indexer** use parallel linears? If it is replicated, turn its
-     padding off (see below) — padding a replicated tensor breaks shape checks.
-   * does the **vision tower** use parallel linears, and does the model declare
-     `supports_encoder_tp_data`? If it uses parallel linears and does *not*
-     support encoder DP, `--mm-encoder-tp-mode data` silently falls back to
-     weight sharding and TP=6 will still fail in the tower.
+   Read four things out of the report:
+   * `[tp-divide]` — every `divide()` call site in the implementation. All of
+     them must be covered by a pad group. As of the probed image there are five,
+     in `kda.py` and `multimodal.py`, plus three bare asserts; a sixth would mean
+     a dimension this shim does not know about.
+   * **indexer** — if `wk_weights_proj` is no longer `disable_tp=True`, it *is*
+     sharded and you need `GLM53_TP_PAD_GROUPS=mla,kda,indexer,moe,vocab`.
+   * **vision tower** — the `encoder-DP gate in vLLM core` section says whether
+     core downgrades `--mm-encoder-tp-mode data` for a class that lacks
+     `supports_encoder_tp_data`. If it does, `patch_encoder_dp` is load-bearing
+     and the debug log must show it firing.
    * do `DefaultModelLoader._get_weights_iterator` and `pad_vocab_size` exist?
+     (`vllm.model_executor.model_loader.loader` reported absent is fine — it is
+     the pre-0.9 fallback seam.)
 
 2. **Boot.** Nothing else changes; the launcher notices that TP does not divide
    and wires the shim in by itself.
@@ -121,8 +175,8 @@ WORKER_IPS="10.0.0.12 10.0.0.13 10.0.0.14 10.0.0.15 10.0.0.16"
    ./scripts/glm53-serve.sh logs
    ```
 
-3. **Check the padding log against this table.** With all groups on, the shim
-   rewrites exactly 75054 of the checkpoint's 76108 tensors:
+3. **Check the padding log against this table.** Under the default groups the
+   shim rewrites exactly 75030 of the checkpoint's 76108 tensors:
 
    | rule | count | | rule | count |
    |---|---|---|---|---|
@@ -131,13 +185,14 @@ WORKER_IPS="10.0.0.12 10.0.0.13 10.0.0.14 10.0.0.15 10.0.0.16"
    | `mla kv_b` | 12 | | `kda gate b_proj` | 68 |
    | `mla o_proj` | 12 | | `kda beta` | 34 |
    | `mla o_proj scale` | 12 | | `kda A_log` | 34 |
-   | `indexer wq_b` | 12 | | `kda dt_bias` | 34 |
-   | `indexer weights_proj` | 12 | | `kda o_proj` | 34 |
-   | `moe gate/up` | 24854 | | `moe down` | 12427 |
-   | `moe gate/up scale` | 24854 | | `moe down scale` | 12427 |
+   | `moe gate/up` | 24854 | | `kda dt_bias` | 34 |
+   | `moe gate/up scale` | 24854 | | `kda o_proj` | 34 |
+   | `moe down` | 12427 | | `moe down scale` | 12427 |
 
    12 = 11 MLA layers + the MTP layer. 43 = 42 sparse-MLP layers + the MTP
-   layer, × 289 (288 routed + 1 shared) for the MoE counts.
+   layer, × 289 (288 routed + 1 shared) for the MoE counts. Turning the indexer
+   group on adds 24 more (`indexer wq_b` 12, `indexer weights_proj` 12) for
+   75054 total.
 
 4. **Verify the output, not just the boot.** Same prompt, `temperature=0`, run
    once at TP=4 and once at TP=6 and compare token by token. If the padding is
@@ -149,12 +204,16 @@ WORKER_IPS="10.0.0.12 10.0.0.13 10.0.0.14 10.0.0.15 10.0.0.16"
 | Variable | Effect |
 |---|---|
 | `GLM53_TP_PAD_DEBUG=1` | log every rewritten tensor (name, shapes, fill mode) |
-| `GLM53_TP_PAD_GROUPS=mla,kda,moe,vocab` | pad only these; here, indexer padding off |
+| `GLM53_TP_PAD_GROUPS=mla,kda,moe,vocab` | the default — indexer padding off |
+| `GLM53_TP_PAD_GROUPS=mla,kda,indexer,moe,vocab` | add the indexer, if a build starts sharding it |
 | `GLM53_TP_PAD_STRICT=0` | warn instead of aborting on an unrecognised extent |
 | `GLM53_MM_ENCODER_TP_MODE=` | drop `--mm-encoder-tp-mode` (older vLLM has no such flag) |
 
 Switching a group off is an explicit claim that the dimension is not TP-sharded
-in this build, so the plan validator stops demanding divisibility for it.
+in this build, so the plan validator stops demanding divisibility for it. That
+is exactly why `indexer` is off by default. The launcher echoes the active set
+on its banner (`groups  kda,mla,moe,vocab`) so a stale override is visible
+before the containers start.
 
 ## How it is wired
 
@@ -173,12 +232,14 @@ patches/glm53_tp_pad/glm53_tp_pad.py
                                   and the two vLLM patches
 ```
 
-Two seams into vLLM, both narrow:
+Two seams into vLLM plus one class-attribute marker, all narrow:
 
 * `DefaultModelLoader._get_weights_iterator` — wrapped so tensors arrive padded
   *before* any per-param `weight_loader` narrows them. vLLM's column/row
   parallel sharding needs no changes at all.
 * `pad_vocab_size` — rebound to be tp-aware.
+* `supports_encoder_tp_data = True` set on the model class, so
+  `--mm-encoder-tp-mode data` is not downgraded to weight sharding.
 
 Everything else rides on the config overlay.
 

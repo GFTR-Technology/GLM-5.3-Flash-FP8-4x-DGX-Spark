@@ -91,19 +91,27 @@ intermediate all divide by 4. TP=6 divides none of them, and the 154880 vocab
 does not either — vLLM's `pad_vocab_size` rounds to 64 and ignores `tp_size`,
 so `divide(154880, 6)` asserts before attention is even reached.
 
-We pad instead of repacking: heads 64→66, indexer 32→36, MoE 2048→2304, vocab
+We pad instead of repacking: MLA and KDA heads 64→66, MoE 2048→2304, vocab
 →154944, applied to the weight stream as it loads. Column-parallel weights get a
 cyclic copy of real heads; row-parallel weights get zeroed padded columns. The
 zeros cancel the padded units' contribution; the copies keep the activations
 feeding `o_proj`/`down_proj` free of all-zero 128-blocks, which DeepGEMM's
 dynamic per-block FP8 quantisation would turn into 0/0.
 
+Two dimensions are handled without padding. The indexer is built with
+`disable_tp=True` in this image, so its 32 heads are replicated per rank and
+never divided — padding them would make the config claim rows the checkpoint
+does not have. The vision tower (1024/16/4096/10240, none divisible by 6) is
+hosted whole per rank via `--mm-encoder-tp-mode data`; the tower implements that
+mode but does not declare `supports_encoder_tp_data`, so the shim sets the
+marker to stop vLLM downgrading the request to weight sharding.
+
 Costs ~6 GiB per rank (the MoE is ~95% of the model and grows 12.5%); TP=6 still
 frees ~19 GiB per rank versus TP=4. MLA replicates its KV latent per rank, so
 the KV pool grows with the freed weight memory, not with the TP count.
 
-Full writeup, including what the vision tower still needs verified on-image:
-[docs/TP6.md](TP6.md).
+Full writeup, including the probe that establishes which dimensions a given
+image actually shards: [docs/TP6.md](TP6.md).
 
 ## Multimodal
 

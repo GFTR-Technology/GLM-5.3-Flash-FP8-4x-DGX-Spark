@@ -51,13 +51,38 @@ class SkipTest(Exception):
 
 
 def test_tp6_plan_matches_the_documented_targets():
-    plan = pad.plan_for_tp(6)
+    plan = pad.plan_for_tp(6, pad.ALL_GROUPS)
     assert plan.active
     assert plan.mla_heads == 66
     assert plan.idx_heads == 36
     assert plan.kda_heads == 66
     assert plan.moe_intermediate == 2304
     assert plan.vocab_pad_to == 192
+
+
+def test_the_default_groups_leave_the_indexer_alone():
+    """The probe found the indexer's only parallel module is built with
+    disable_tp=True, so its 32 heads are replicated, never divided. Padding them
+    would be dead work, and the overlay would then have to claim index_n_heads=36
+    against 32-row weights on disk."""
+    assert "indexer" not in pad.DEFAULT_GROUPS
+    assert set(pad.DEFAULT_GROUPS) == {"mla", "kda", "moe", "vocab"}
+
+    plan = pad.plan_for_tp(6)
+    assert plan.active
+    assert plan.idx_heads == pad.IDX_HEADS == 32
+    whats = {r.what for r in pad.build_rules(plan)}
+    assert not any(w.startswith("indexer") for w in whats)
+    # ...and everything else still fires.
+    assert plan.mla_heads == 66 and plan.kda_heads == 66
+    assert plan.moe_intermediate == 2304
+
+
+def test_indexer_group_is_still_available_on_request():
+    plan = pad.plan_for_tp(6, "mla,kda,indexer,moe,vocab".split(","))
+    assert plan.idx_heads == 36
+    whats = {r.what for r in pad.build_rules(plan)}
+    assert {"indexer wq_b", "indexer weights_proj"} <= whats
 
 
 def test_tp4_needs_no_padding():
@@ -79,7 +104,7 @@ def build_rule_count(plan):
 
 def test_every_tp_up_to_16_yields_a_shardable_block_aligned_plan():
     for tp in range(1, 17):
-        plan = pad.plan_for_tp(tp)  # raises if a check fails
+        plan = pad.plan_for_tp(tp, pad.ALL_GROUPS)  # raises if a check fails
         assert plan.mla_heads % tp == 0
         assert plan.kda_heads % tp == 0
         assert plan.idx_heads % tp == 0
@@ -191,7 +216,7 @@ def _match(rules, name, shape):
 
 
 def test_rules_hit_exactly_the_intended_checkpoint_tensors():
-    rules = pad.build_rules(pad.plan_for_tp(6))
+    rules = pad.build_rules(pad.plan_for_tp(6, pad.ALL_GROUPS))
     wrong = []
     for name, shape, expected in REAL_TENSORS:
         got = _match(rules, name, shape)
@@ -202,13 +227,13 @@ def test_rules_hit_exactly_the_intended_checkpoint_tensors():
 
 def test_mla_and_kda_o_proj_are_told_apart_by_shape_alone():
     # Both are `self_attn.o_proj.weight`. Only the extent distinguishes them.
-    rules = pad.build_rules(pad.plan_for_tp(6))
+    rules = pad.build_rules(pad.plan_for_tp(6, pad.ALL_GROUPS))
     assert _match(rules, f"{L}.3.self_attn.o_proj.weight", (4096, 16384)) == "mla o_proj"
     assert _match(rules, f"{L}.0.self_attn.o_proj.weight", (4096, 8192)) == "kda o_proj"
 
 
 def test_every_rule_is_exercised_by_the_fixture():
-    rules = pad.build_rules(pad.plan_for_tp(6))
+    rules = pad.build_rules(pad.plan_for_tp(6, pad.ALL_GROUPS))
     covered = {_match(rules, n, s) for n, s, _ in REAL_TENSORS} - {None}
     missing = {r.what for r in rules} - covered
     assert not missing, f"rules never exercised by the fixture: {sorted(missing)}"
@@ -216,13 +241,38 @@ def test_every_rule_is_exercised_by_the_fixture():
 
 def test_output_side_rules_are_zero_or_ones_never_replicate():
     """The whole correctness argument rests on this split."""
-    for rule in pad.build_rules(pad.plan_for_tp(6)):
+    for rule in pad.build_rules(pad.plan_for_tp(6, pad.ALL_GROUPS)):
         if rule.what in ("mla o_proj", "kda o_proj", "moe down"):
             assert rule.mode == pad.ZERO, rule.what
         if rule.what == "indexer weights_proj":
             assert rule.mode == pad.ZERO, "padded indexer heads must not move top-k"
         if rule.what.endswith("scale") and rule.mode != pad.REPLICATE:
             assert rule.mode == pad.ONES, rule.what
+
+
+def test_default_rules_pass_the_indexer_through_untouched():
+    """With `indexer` off, its tensors must match no rule — and must not be
+    reported as an unknown extent either, which is the difference between
+    "a group is disabled" and "the checkpoint moved under us"."""
+    rules = pad.build_rules(pad.plan_for_tp(6))
+    indexer_tensors = [
+        (n, s) for n, s, w in REAL_TENSORS if w and w.startswith("indexer")
+    ]
+    assert indexer_tensors, "fixture should carry the indexer tensors"
+    for name, shape in indexer_tensors:
+        assert _match(rules, name, shape) is None, name
+
+    padder = pad.Padder(pad.plan_for_tp(6), strict=True)
+    for name, shape in indexer_tensors:
+        padder._check_unmatched(name, _FakeShape(shape))
+    assert padder.skipped == []
+
+
+class _FakeShape:
+    """Just enough of a tensor for the name/shape bookkeeping paths."""
+
+    def __init__(self, shape):
+        self.shape = shape
 
 
 # ---------------------------------------------------------------------------
@@ -281,8 +331,10 @@ def test_cli_emits_shell_assignments():
 # ---------------------------------------------------------------------------
 
 
-def _pad(name, tensor, tp=6):
-    padder = pad.Padder(pad.plan_for_tp(tp), strict=False)
+def _pad(name, tensor, tp=6, groups=pad.ALL_GROUPS):
+    # Rule mechanics are exercised against the full table; the default-group
+    # selection is a deployment choice tested separately.
+    padder = pad.Padder(pad.plan_for_tp(tp, groups), strict=False)
     return padder.apply(name, tensor)
 
 
@@ -314,6 +366,15 @@ def test_padded_shapes_match_the_config_overlay():
         for dim, size in enumerate(out.shape):
             if size in (want[dim],) and size != src_shape[dim]:
                 assert size % 6 == 0, f"{name} dim{dim}={size} not divisible by 6"
+
+    # ...and under the shipped default groups the indexer comes back untouched.
+    for name, src_shape, _ in cases:
+        src = torch.zeros(src_shape, dtype=torch.bfloat16)
+        out = _pad(name, src, groups=pad.DEFAULT_GROUPS)
+        if ".indexer." in name:
+            assert out is src, f"{name} must not be rewritten by default"
+        else:
+            assert out is not src, f"{name} must still be padded by default"
 
 
 def test_replicate_fill_cycles_from_index_zero():
@@ -371,7 +432,7 @@ def test_strict_mode_rejects_an_unknown_extent():
     """If the checkpoint changes shape under us we want a loud failure, not a
     silently unpadded tensor that dies inside a kernel 12 minutes later."""
     requires_torch()
-    padder = pad.Padder(pad.plan_for_tp(6), strict=True)
+    padder = pad.Padder(pad.plan_for_tp(6, pad.ALL_GROUPS), strict=True)
     padder.apply(f"{L}.3.self_attn.q_b_proj.weight", torch.zeros(12345, 1536))
     assert padder.skipped
     try:
@@ -389,7 +450,7 @@ def test_stream_wrapper_reports_and_passes_everything_through():
         (f"{L}.0.self_attn.A_log", torch.zeros(64)),
         (f"{L}.0.input_layernorm.weight", torch.zeros(4096, dtype=torch.bfloat16)),
     ]
-    padder = pad.Padder(pad.plan_for_tp(6), strict=False)
+    padder = pad.Padder(pad.plan_for_tp(6, pad.ALL_GROUPS), strict=False)
     out = dict(padder.wrap(iter(stream)))
     assert out[f"{L}.3.self_attn.q_b_proj.weight"].shape[0] == 16896
     assert out[f"{L}.0.self_attn.A_log"].shape[0] == 66
@@ -594,12 +655,19 @@ CONFIG_FIXTURE = {
     "architectures": ["Glm5NextForConditionalGeneration"],
     "model_type": "glm5_next",
     "text_config": {
+        "hidden_size": 4096,
         "num_attention_heads": 64,
         "num_key_value_heads": 64,
+        # Explicit in the published config, and 0 because MLA sizes itself from
+        # qk_nope_head_dim / v_head_dim instead. Explicit is what matters here:
+        # if it were absent the config class would derive hidden_size // heads
+        # and our head bump would silently move it 64 -> 62.
+        "head_dim": 0,
         "index_n_heads": 32,
         "moe_intermediate_size": 2048,
         "intermediate_size": 12288,
         "n_routed_experts": 288,
+        "n_shared_experts": 1,
         "vocab_size": 154880,
         "linear_attn_config": {"num_heads": 64, "head_dim": 128},
     },
@@ -626,7 +694,7 @@ def test_rewrite_config_produces_the_documented_values():
     import make_overlay
 
     config = make_overlay.rewrite_config(
-        copy.deepcopy(CONFIG_FIXTURE), pad.plan_for_tp(6)
+        copy.deepcopy(CONFIG_FIXTURE), pad.plan_for_tp(6, pad.ALL_GROUPS)
     )
     text = config["text_config"]
     assert (text["num_attention_heads"], text["index_n_heads"]) == (66, 36)
@@ -634,6 +702,122 @@ def test_rewrite_config_produces_the_documented_values():
     assert text["linear_attn_config"]["num_heads"] == 66
     assert text["vocab_size"] == 154880
     assert len(config["_glm53_tp_pad"]["changes"]) == 5
+
+
+def test_default_groups_leave_index_n_heads_at_32_in_the_config():
+    """The config and the weight stream have to tell vLLM the same story.
+
+    Nothing pads the indexer under the default groups, so claiming 36 heads here
+    would have vLLM build a 36-head module and then fail loading 32 rows into it.
+    """
+    import copy
+
+    sys.path.insert(0, SHIM_DIR)
+    import make_overlay
+
+    config = make_overlay.rewrite_config(
+        copy.deepcopy(CONFIG_FIXTURE), pad.plan_for_tp(6)
+    )
+    text = config["text_config"]
+    assert text["index_n_heads"] == 32
+    assert text["num_attention_heads"] == 66
+    assert text["linear_attn_config"]["num_heads"] == 66
+    assert text["moe_intermediate_size"] == 2304
+    assert "indexer" not in config["_glm53_tp_pad"]["groups"]
+
+
+def test_head_dim_is_pinned_when_the_config_would_otherwise_derive_it():
+    """Glm5NextTextConfig falls back to hidden_size // num_attention_heads.
+
+    The published config sets head_dim explicitly so nothing moves, but a later
+    release that drops the key would silently go 4096//64=64 -> 4096//66=62.
+    """
+    import copy
+
+    sys.path.insert(0, SHIM_DIR)
+    import make_overlay
+
+    # As shipped: explicit head_dim, so the pin must not fire.
+    kept = make_overlay.rewrite_config(
+        copy.deepcopy(CONFIG_FIXTURE), pad.plan_for_tp(6)
+    )
+    assert kept["text_config"]["head_dim"] == 0
+
+    # Hypothetical release that omits it.
+    fixture = copy.deepcopy(CONFIG_FIXTURE)
+    del fixture["text_config"]["head_dim"]
+    pinned = make_overlay.rewrite_config(fixture, pad.plan_for_tp(6))
+    assert pinned["text_config"]["head_dim"] == 4096 // 64 == 64
+    assert pinned["text_config"]["num_attention_heads"] == 66
+
+
+def test_encoder_dp_marker_is_set_on_the_model_class():
+    """The vision tower is 1024/16/4096/10240 and nothing pads it.
+
+    It only survives TP=6 as a whole-weights-per-rank encoder, which the
+    implementation supports but does not advertise. The shim advertises it.
+    """
+    import types
+
+    module = types.ModuleType("vllm.models.glm5next.nvidia.model")
+
+    class Glm5NextForConditionalGeneration:
+        pass
+
+    class _SomeHelper:
+        pass
+
+    imported = type("OtherModelForConditionalGeneration", (), {})
+    imported.__module__ = "vllm.model_executor.models.someone_else"
+
+    Glm5NextForConditionalGeneration.__module__ = module.__name__
+    _SomeHelper.__module__ = module.__name__
+    module.Glm5NextForConditionalGeneration = Glm5NextForConditionalGeneration
+    module._SomeHelper = _SomeHelper
+    module.OtherModelForConditionalGeneration = imported
+
+    saved = dict(pad._state)
+    saved_env = os.environ.get("GLM53_TP_PAD")
+    try:
+        pad._state.update({"plan": None, "encoder_dp_patched": False})
+        os.environ["GLM53_TP_PAD"] = "6"
+        assert pad.patch_encoder_dp(module) is True
+        assert Glm5NextForConditionalGeneration.supports_encoder_tp_data is True
+        # Only classes this module defines, and only model entry points.
+        assert not hasattr(_SomeHelper, "supports_encoder_tp_data")
+        assert not hasattr(imported, "supports_encoder_tp_data")
+    finally:
+        pad._state.clear()
+        pad._state.update(saved)
+        if saved_env is None:
+            os.environ.pop("GLM53_TP_PAD", None)
+        else:
+            os.environ["GLM53_TP_PAD"] = saved_env
+
+
+def test_encoder_dp_marker_is_not_set_when_the_shim_is_off():
+    import types
+
+    module = types.ModuleType("vllm.models.glm5next.nvidia.model")
+
+    class Glm5NextForConditionalGeneration:
+        pass
+
+    Glm5NextForConditionalGeneration.__module__ = module.__name__
+    module.Glm5NextForConditionalGeneration = Glm5NextForConditionalGeneration
+
+    saved = dict(pad._state)
+    saved_env = os.environ.get("GLM53_TP_PAD")
+    try:
+        pad._state.update({"plan": None, "encoder_dp_patched": False})
+        os.environ.pop("GLM53_TP_PAD", None)
+        assert pad.patch_encoder_dp(module) is False
+        assert not hasattr(Glm5NextForConditionalGeneration, "supports_encoder_tp_data")
+    finally:
+        pad._state.clear()
+        pad._state.update(saved)
+        if saved_env is not None:
+            os.environ["GLM53_TP_PAD"] = saved_env
 
 
 def test_make_overlay_rewrites_config_and_symlinks_the_rest():
@@ -662,7 +846,10 @@ def test_make_overlay_rewrites_config_and_symlinks_the_rest():
         text = config["text_config"]
         assert text["num_attention_heads"] == 66
         assert text["num_key_value_heads"] == 66
-        assert text["index_n_heads"] == 36
+        # The indexer is replicated (disable_tp=True), so it is not in the
+        # default groups and the config must keep claiming 32 — the weights on
+        # disk still have 32 rows and nothing pads them.
+        assert text["index_n_heads"] == 32
         assert text["moe_intermediate_size"] == 2304
         assert text["linear_attn_config"]["num_heads"] == 66
         # vocab_size must NOT move: the lm_head on disk still has 154880 rows,

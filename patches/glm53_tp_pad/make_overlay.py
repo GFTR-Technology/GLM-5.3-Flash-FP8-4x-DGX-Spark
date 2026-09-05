@@ -10,6 +10,11 @@ monkeypatching the config classes, we hand vLLM a directory that symlinks the
 `vocab_size` is deliberately left alone: the vocab is padded inside vLLM by
 `pad_vocab_size`, and the lm_head/embed weights on disk still have 154880 rows.
 Bumping it here would make vLLM expect rows the checkpoint does not have.
+
+Every other field is rewritten only when its pad group is enabled, because the
+config and the weight stream have to tell vLLM the same story. `index_n_heads`
+in particular stays at 32 under the default groups — the indexer is replicated,
+not sharded, so its weights are not padded and the config must not claim 36.
 """
 
 from __future__ import annotations
@@ -58,6 +63,13 @@ def rewrite_config(config: dict, plan: pad.PadPlan) -> dict:
             container[key] = value
 
     if "mla" in plan.groups:
+        # Glm5NextTextConfig derives head_dim as `hidden_size // num_attention_heads`
+        # when the config omits it, so bumping the head count would silently move
+        # head_dim too (4096//64=64 -> 4096//66=62). This checkpoint ships it
+        # explicitly (as 0 — MLA uses qk_nope_head_dim / v_head_dim instead), so
+        # nothing moves; pin it anyway in case a later release drops the key.
+        if text.get("head_dim") is None and isinstance(text.get("hidden_size"), int):
+            put(text, "head_dim", text["hidden_size"] // pad.MLA_HEADS, "text_config")
         put(text, "num_attention_heads", plan.mla_heads, "text_config")
         # MLA ignores this, but leaving it at 64 next to a 66-head config is a
         # trap for anyone reading the file later.
@@ -128,7 +140,8 @@ def main() -> int:
     parser.add_argument(
         "--groups",
         default=os.environ.get("GLM53_TP_PAD_GROUPS", ""),
-        help="comma list from mla,kda,indexer,moe,vocab (default: all)",
+        help="comma list from mla,kda,indexer,moe,vocab "
+        "(default: %s)" % ",".join(pad.DEFAULT_GROUPS),
     )
     args = parser.parse_args()
 

@@ -187,11 +187,13 @@ Two things to know before you rely on it:
 - The **lane seq counts (15 / 5 / 3) were measured at TP=4.** Weights drop to
   ~57 GiB/rank at TP=6, which roughly doubles what is left for KV — re-bench
   with `scripts/bench_lanes.py` rather than assuming the old numbers scale.
-- The **vision tower** is the one piece not settled from the config alone. Its
-  dims (1024 / 16 heads / 4096) divide by neither 6 nor most odd TPs, so the
-  launcher passes `--mm-encoder-tp-mode data` to host the encoder whole on each
-  rank. vLLM falls back to weight sharding if the model does not implement
-  encoder DP; the probe report tells you which case you are in.
+- **Which dimensions get padded is a property of the image, not the checkpoint.**
+  On the probed image, MLA heads, KDA heads, the MoE intermediate and the vocab
+  are sharded and get padded; the 32-head indexer is built `disable_tp=True`, so
+  it is replicated and deliberately left alone; the vision tower is hosted whole
+  per rank via `--mm-encoder-tp-mode data`. Re-run the probe after an image bump
+  and compare — its `[tp-divide]` list and the `encoder-DP gate` section are the
+  two things to read.
 
 Everything else — the SM121 image, the `patches/` bind-mounts, the lanes, MTP —
 is unchanged. Details and the padding scheme: [docs/TP6.md](TP6.md).
@@ -210,6 +212,8 @@ is unchanged. Details and the padding scheme: [docs/TP6.md](TP6.md).
 | `[glm53-tp-pad] ... not by any known shape` | The checkpoint was re-released with different dims. Re-check the constants at the top of `patches/glm53_tp_pad/glm53_tp_pad.py` against the new `config.json`. |
 | `[glm53-tp-pad] no tensor matched these rules` | vLLM renamed weights, or a group is padding something this build does not shard. Narrow with `GLM53_TP_PAD_GROUPS`. |
 | `unrecognized arguments: --mm-encoder-tp-mode` | Older vLLM in the image. `GLM53_MM_ENCODER_TP_MODE= ./scripts/glm53-serve.sh` drops the flag. |
+| `divide(16, 6)` / assert inside the vision tower | The encoder-DP marker did not stick. Every rank's log should carry `[glm53-tp-pad] supports_encoder_tp_data=True on Glm5NextForConditionalGeneration`; if it does not, the model module path changed — add it to `HOOKS` in `glm53_tp_pad.py`. |
+| `index_n_heads` / indexer shape mismatch at load | The indexer is being padded against unpadded weights, or this build shards it and it is not being padded. Check `disable_tp` on `wk_weights_proj` in the probe, then set `GLM53_TP_PAD_GROUPS` accordingly. |
 | Head OOM / `NV_ERR_NO_MEMORY` | gmu too high. Rank 0 also holds the API. Stay at 0.85 unless the OS is stripped. |
 
 Design notes and the CUDA-graph fix: [docs/DESIGN.md](DESIGN.md). Numbers: [docs/BENCH.md](BENCH.md).

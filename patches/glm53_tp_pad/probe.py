@@ -22,6 +22,10 @@ import sys
 
 SECTION = "=" * 72
 
+#: Kept in step with glm53_tp_pad.ENCODER_DP_MARKER without importing it here —
+#: this section runs before the plan section adds the shim to sys.path.
+ENCODER_DP_MARKER = "supports_encoder_tp_data"
+
 # What we want to know about the custom implementation, and why.
 GREPS = [
     ("tp-divide", r"\bdivide\s*\(", "every divisibility assert that TP=6 can trip"),
@@ -33,7 +37,7 @@ GREPS = [
     ("col-parallel", r"ColumnParallelLinear|QKVParallelLinear|MergedColumnParallel", ""),
     ("row-parallel", r"RowParallelLinear", ""),
     ("disable-tp", r"disable_tp", "can a submodule opt out of TP?"),
-    ("encoder-dp", r"encoder_tp_mode|supports_encoder_tp_data", "vision DP support"),
+    ("encoder-dp", r"encoder_tp_mode|supports_encoder_tp_data|use_data_parallel", "vision DP support"),
 ]
 
 
@@ -137,10 +141,37 @@ def section_vision(root: str, files: list[str]) -> None:
         if n_par or n_plain:
             print(f"  {rel}: {n_par} parallel linear(s), {n_plain} nn.Linear")
     print("\n  encoder-DP capability:")
+    declares = False
+    honours = 0
+    reads_mode = False
     for path in files:
         text = _read(path)
-        if "supports_encoder_tp_data" in text:
-            print(f"    {os.path.relpath(path, root)}: declares supports_encoder_tp_data")
+        rel = os.path.relpath(path, root)
+        if ENCODER_DP_MARKER in text:
+            declares = True
+            print(f"    {rel}: declares {ENCODER_DP_MARKER}")
+        if "mm_encoder_tp_mode" in text:
+            reads_mode = True
+            print(f"    {rel}: reads mm_encoder_tp_mode")
+        honours += len(re.findall(r"disable_tp\s*=\s*use_data_parallel", text))
+    if honours:
+        print(f"    {honours} vision linear(s) built with disable_tp=use_data_parallel")
+    if reads_mode and honours and not declares:
+        print(
+            "\n    VERDICT: the tower implements encoder DP but never declares the\n"
+            f"    {ENCODER_DP_MARKER} marker. If vLLM core gates on that marker it will\n"
+            "    downgrade --mm-encoder-tp-mode data to 'weights' and shard the tower\n"
+            "    anyway. glm53_tp_pad.patch_encoder_dp sets the marker for exactly\n"
+            "    this case; see the next section for whether the gate exists."
+        )
+    elif declares:
+        print("\n    VERDICT: declares the marker itself; the shim's patch is a no-op.")
+    elif not honours:
+        print(
+            "\n    VERDICT: no disable_tp=use_data_parallel found. The tower may not\n"
+            "    support DP at all — TP=6 would need the vision dims padded too,\n"
+            "    which this shim does not do. Stop and re-read multimodal.py."
+        )
 
 
 def section_seams() -> None:
@@ -150,21 +181,25 @@ def section_seams() -> None:
         (
             "vllm.model_executor.model_loader.default_loader",
             ["DefaultModelLoader._get_weights_iterator", "DefaultModelLoader.get_all_weights"],
+            True,
         ),
         (
             "vllm.model_executor.model_loader.loader",
             ["DefaultModelLoader._get_weights_iterator"],
+            False,  # pre-0.9 layout; absent on any current build, and that is fine
         ),
         (
             "vllm.model_executor.layers.vocab_parallel_embedding",
             ["pad_vocab_size", "vocab_range_from_global_vocab_size"],
+            True,
         ),
     ]
-    for module_name, attrs in checks:
+    for module_name, attrs, required in checks:
         try:
             module = importlib.import_module(module_name)
         except Exception as exc:
-            print(f"  {module_name}: NOT IMPORTABLE ({type(exc).__name__}: {exc})")
+            verdict = "NOT IMPORTABLE" if required else "absent (optional fallback, fine)"
+            print(f"  {module_name}: {verdict} ({type(exc).__name__})")
             continue
         print(f"  {module_name}: ok")
         for attr in attrs:
@@ -191,6 +226,39 @@ def section_seams() -> None:
         ]
         print(f"\n  pad_vocab_size re-import sites currently loaded: {sites or 'none'}")
         print("  (the shim rebinds these too, but only those imported by then)")
+
+
+def section_encoder_dp_gate(root: str) -> None:
+    """Does vLLM core gate --mm-encoder-tp-mode=data on a model-class marker?
+
+    The glm5next tower honours the mode correctly (tp_size=1 + disable_tp on
+    every vision linear) but never declares ``supports_encoder_tp_data``. If the
+    core checks for that marker, the request is downgraded to ``weights`` and the
+    16-head tower shards into ``divide(16, 6)``. The shim sets the marker; this
+    section is how you confirm the gate is the reason it has to.
+    """
+    _print_header("encoder-DP gate in vLLM core")
+    wanted = re.compile(r"supports_encoder_tp_data|mm_encoder_tp_mode")
+    scopes = ["config", "multimodal", "model_executor/models/interfaces.py", "v1/worker"]
+    hits = 0
+    for scope in scopes:
+        target = os.path.join(root, scope)
+        paths = [target] if os.path.isfile(target) else list(_walk_py(target)) if os.path.isdir(target) else []
+        for path in paths:
+            for lineno, line in enumerate(_read(path).splitlines(), 1):
+                if wanted.search(line):
+                    hits += 1
+                    if hits <= 40:
+                        print(f"    {os.path.relpath(path, root)}:{lineno}: {line.strip()[:110]}")
+    if hits > 40:
+        print(f"    ... {hits - 40} more")
+    if not hits:
+        print("  no gate found — the mode is probably passed straight through.")
+    print(
+        "\n  Read for: a line that resets mm_encoder_tp_mode to 'weights' when the\n"
+        "  model class lacks supports_encoder_tp_data. If it exists, the shim's\n"
+        "  patch_encoder_dp is load-bearing; if not, it is a harmless no-op."
+    )
 
 
 def section_sitecustomize() -> None:
@@ -220,6 +288,10 @@ def section_plan(tp: int) -> None:
         return
     plan = glm53_tp_pad.plan_for_tp(tp)
     print(f"  active: {plan.active}")
+    print(f"  groups: {','.join(sorted(plan.groups))} (default)")
+    off = sorted(set(glm53_tp_pad.ALL_GROUPS) - plan.groups)
+    if off:
+        print(f"  off:    {','.join(off)} — not TP-sharded in this build")
     print(f"  {plan.summary()}")
     print("\n  rules that will fire:")
     for rule in glm53_tp_pad.build_rules(plan):
@@ -245,6 +317,7 @@ def main() -> int:
     section_greps(root, files)
     section_vision(root, files)
     section_seams()
+    section_encoder_dp_gate(root)
     section_sitecustomize()
     section_plan(args.tp)
     print(f"\n{SECTION}\nprobe complete — nothing was modified\n{SECTION}")

@@ -30,7 +30,18 @@ the output-side zeros still cancel the contribution.
 The one exception is ``indexer.weights_proj`` (one row per indexer head, it is
 the *combining* weight for the per-head index logits). Semantically that is an
 output-side tensor, so padded heads must get **zero** there or they would
-perturb the top-k token selection.
+perturb the top-k token selection. That group is **off by default** — see below.
+
+The indexer is not sharded
+--------------------------
+``scripts/glm53-tp-probe.sh`` settled this against the image's own glm5next
+drop: the indexer's only parallel module is built with ``disable_tp=True``
+(``models/glm5next/nvidia/attention.py:259-264``), and ``index_n_heads`` never
+meets ``tp_size`` or ``divide()`` anywhere in that implementation. The 32 heads
+are replicated on every rank, so TP=6 does not need them padded and padding them
+would only put 4 dead heads through a top-k kernel that already has its own
+head-count fixup path. ``indexer`` therefore stays out of ``DEFAULT_GROUPS``;
+it is one env var away if a future build starts sharding it.
 
 Because the replicate fill is a cyclic copy from index 0 and every affected
 tensor is head-major, head ``H+i`` consistently receives head ``i``'s weights
@@ -52,7 +63,8 @@ respectively, and only MLA's is FP8.
 Env vars
 --------
 ``GLM53_TP_PAD``         tensor parallel size. Unset/1 -> shim does nothing.
-``GLM53_TP_PAD_GROUPS``  comma list from {mla,kda,indexer,moe,vocab}. Default all.
+``GLM53_TP_PAD_GROUPS``  comma list from {mla,kda,indexer,moe,vocab}.
+                         Default ``mla,kda,moe,vocab`` (see above for indexer).
 ``GLM53_TP_PAD_DEBUG``   1 -> log every rewritten tensor.
 ``GLM53_TP_PAD_STRICT``  0 -> downgrade consistency errors to warnings.
 """
@@ -76,6 +88,7 @@ __all__ = [
     "Padder",
     "patch_weight_loader",
     "patch_vocab_padding",
+    "patch_encoder_dp",
     "install",
 ]
 
@@ -99,6 +112,15 @@ VOCAB_SIZE = 154880  # text_config.vocab_size
 FP8_BLOCK = 128  # blockwise FP8 scale granularity
 
 ALL_GROUPS = ("mla", "kda", "indexer", "moe", "vocab")
+
+#: What actually gets padded unless told otherwise. ``indexer`` is excluded on
+#: purpose: the image's glm5next builds the indexer's only parallel module with
+#: ``disable_tp=True``, so its 32 heads live whole on every rank and never meet
+#: a divisibility assert. Padding them would be pure dead work on a top-k kernel
+#: that already carries its own head-count fixup. Re-enable with
+#: ``GLM53_TP_PAD_GROUPS=mla,kda,indexer,moe,vocab`` if a build starts sharding
+#: it — ``scripts/glm53-tp-probe.sh`` is what tells you.
+DEFAULT_GROUPS = ("mla", "kda", "moe", "vocab")
 
 _fp8_cache: tuple | None = None
 
@@ -178,7 +200,7 @@ def plan_for_tp(tp: int, groups: Iterable[str] | None = None) -> PadPlan:
     """
     if tp < 1:
         raise ValueError(f"tp must be >= 1, got {tp}")
-    selected = frozenset(ALL_GROUPS if groups is None else groups)
+    selected = frozenset(DEFAULT_GROUPS if groups is None else groups)
     unknown = selected - frozenset(ALL_GROUPS)
     if unknown:
         raise ValueError(f"unknown pad groups: {sorted(unknown)}")
@@ -523,7 +545,12 @@ def _log(message: str) -> None:
 # vLLM patches
 # ---------------------------------------------------------------------------
 
-_state: dict = {"plan": None, "loader_patched": False, "vocab_patched": False}
+_state: dict = {
+    "plan": None,
+    "loader_patched": False,
+    "vocab_patched": False,
+    "encoder_dp_patched": False,
+}
 
 
 def _env_plan() -> PadPlan | None:
@@ -643,12 +670,77 @@ def patch_vocab_padding(module) -> bool:
     return True
 
 
+#: Classes carrying this marker let vLLM honour ``--mm-encoder-tp-mode data``.
+ENCODER_DP_MARKER = "supports_encoder_tp_data"
+
+
+def patch_encoder_dp(module) -> bool:
+    """Declare encoder data-parallel support on the glm5next model class.
+
+    The vision tower is 1024 wide with 16 heads, a 4096 MLP and a 10240 merger.
+    None of those divide by 6 and none of them is padded here — the tower is not
+    part of any pad group, so hosting the encoder whole on every rank is the only
+    way through. The implementation already does exactly that when asked:
+    ``use_data_parallel`` (set from ``mm_encoder_tp_mode == "data"``) forces the
+    tower's ``tp_size`` to 1 and passes ``disable_tp=True`` to every vision
+    linear. What it never does is set the ``supports_encoder_tp_data`` marker
+    that vLLM checks before it grants the mode — without it the request is
+    silently downgraded to ``weights`` and the tower shards anyway, straight into
+    ``divide(16, 6)``.
+
+    Setting the marker is a statement about the model, not a behaviour change:
+    if vLLM's build has no such gate the attribute is simply unused.
+    """
+    plan = _state.get("plan") or _env_plan()
+    if plan is None:
+        return False
+    _state["plan"] = plan
+    if _state["encoder_dp_patched"]:
+        return True
+
+    marked = []
+    for attr in dir(module):
+        obj = getattr(module, attr, None)
+        if not isinstance(obj, type):
+            continue
+        # Only classes this module actually defines, so we cannot brand an
+        # imported base class that other models share.
+        if getattr(obj, "__module__", None) != getattr(module, "__name__", None):
+            continue
+        if not attr.endswith("ForConditionalGeneration"):
+            continue
+        if getattr(obj, ENCODER_DP_MARKER, False):
+            continue
+        try:
+            setattr(obj, ENCODER_DP_MARKER, True)
+        except Exception as exc:  # pragma: no cover - exotic metaclass
+            _log(f"WARNING: could not mark {attr}.{ENCODER_DP_MARKER}: {exc}")
+            continue
+        marked.append(attr)
+
+    if not marked:
+        return False
+    _state["encoder_dp_patched"] = True
+    _log(
+        f"{ENCODER_DP_MARKER}=True on {', '.join(marked)} — the vision tower "
+        "(1024/16/4096/10240, none divisible by "
+        f"{plan.tp}) stays whole on every rank. Requires "
+        "--mm-encoder-tp-mode data on the command line."
+    )
+    return True
+
+
 #: module name -> patch function, consumed by sitecustomize.py.
 HOOKS: dict[str, Callable] = {
     "vllm.model_executor.model_loader.default_loader": patch_weight_loader,
     # older layouts kept the loaders in one module
     "vllm.model_executor.model_loader.loader": patch_weight_loader,
     "vllm.model_executor.layers.vocab_parallel_embedding": patch_vocab_padding,
+    # The glm5next drop lives outside vllm.model_executor.models in this image;
+    # candidates that do not exist simply never fire.
+    "vllm.models.glm5next.nvidia.model": patch_encoder_dp,
+    "vllm.model_executor.models.glm5next.nvidia.model": patch_encoder_dp,
+    "vllm.model_executor.models.glm5next": patch_encoder_dp,
 }
 
 
@@ -689,6 +781,7 @@ def _main(argv: list[str] | None = None) -> int:
 
         print(f"GLM53_PAD_ACTIVE={1 if plan.active else 0}")
         print(f"GLM53_PAD_SUMMARY={shlex.quote(plan.summary())}")
+        print(f"GLM53_PAD_GROUPS={shlex.quote(','.join(sorted(plan.groups)))}")
         print(f"GLM53_PAD_MLA_HEADS={plan.mla_heads}")
         print(f"GLM53_PAD_IDX_HEADS={plan.idx_heads}")
         print(f"GLM53_PAD_KDA_HEADS={plan.kda_heads}")
@@ -696,7 +789,7 @@ def _main(argv: list[str] | None = None) -> int:
         print(f"GLM53_PAD_VOCAB={_round_up(VOCAB_SIZE, plan.vocab_pad_to)}")
         return 0
 
-    print(f"TP={plan.tp} active={plan.active}")
+    print(f"TP={plan.tp} active={plan.active} groups={','.join(sorted(plan.groups))}")
     print(f"  {plan.summary()}")
     for rule in build_rules(plan):
         print(

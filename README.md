@@ -96,11 +96,13 @@ Tony's NVFP4 + Marlin recipe is the working 2-Spark path: [GLM-5.3-Flash-NVFP4-2
 
 TP comes from the node count, so six IPs means TP=6 — and TP=6 divides **nothing** in this model: 64 MLA heads, 64 KDA heads, 32 indexer heads, a 2048 MoE intermediate, a 154880 vocab. vLLM asserts in `divide()` long before the first forward.
 
-`patches/glm53_tp_pad/` pads all of them as the weights load (heads 64→66, indexer 32→36, MoE 2048→2304, vocab →154944) and hands vLLM a symlink overlay whose `config.json` agrees. Padded units get a copy of a real head on the input side and zeros on the output side, so they contribute exactly nothing. Nothing on disk changes. `./scripts/glm53-serve.sh` turns it on by itself when TP does not divide; TP=4 is untouched.
+`patches/glm53_tp_pad/` pads the sharded ones as the weights load (MLA and KDA heads 64→66, MoE 2048→2304, vocab →154944) and hands vLLM a symlink overlay whose `config.json` agrees. Padded units get a copy of a real head on the input side and zeros on the output side, so they contribute exactly nothing. Nothing on disk changes. `./scripts/glm53-serve.sh` turns it on by itself when TP does not divide; TP=4 is untouched.
+
+The 32-head indexer is *not* padded: the probe found it built with `disable_tp=True`, so it is replicated per rank and never divided. The vision tower is not padded either — it is hosted whole on every rank via `--mm-encoder-tp-mode data`.
 
 Weights drop to ~57 GiB/rank (from ~76 at TP=4), which roughly doubles the KV budget. The lane seq counts below were measured at TP=4 — re-bench on six.
 
-Read [docs/TP6.md](docs/TP6.md) before the first six-node boot; the vision tower is the one piece that needs confirming against your image, and `./scripts/glm53-tp-probe.sh` tells you.
+Read [docs/TP6.md](docs/TP6.md) before the first six-node boot, and run `./scripts/glm53-tp-probe.sh` once against your image: which dimensions this build actually shards is a property of the image, not the checkpoint.
 
 ## Credits
 

@@ -51,9 +51,14 @@ say()  { printf '\n\033[1;36m== %s\033[0m\n' "$*"; }
 die()  { printf '\n\033[31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
 
 # --- head/dim padding for a TP that does not divide the model ---------------
-# 64 MLA heads, 64 KDA heads, 32 indexer heads, a 2048 MoE intermediate and a
-# 154880 vocab. At TP=6 none of those divide, and vLLM asserts in divide()
-# before the first forward. The shim pads them as the weights stream in.
+# 64 MLA heads, 64 KDA heads, a 2048 MoE intermediate and a 154880 vocab. At
+# TP=6 none of those divide, and vLLM asserts in divide() before the first
+# forward. The shim pads them as the weights stream in.
+#
+# The 32-head sparse indexer is NOT padded: the image builds it with
+# disable_tp=True, so it is replicated per rank and never divided. Its term is
+# kept in the predicate below only as a conservative trigger — the authoritative
+# answer is GLM53_PAD_ACTIVE from the Python plan a few lines down.
 PAD_SHIM_DIR="$PATCH_HOST/glm53_tp_pad"
 MODEL_DIR=/model
 PAD_ACTIVE=0
@@ -78,11 +83,18 @@ if [ "$PAD_ACTIVE" = 1 ]; then
 check the constants in $PAD_SHIM_DIR/glm53_tp_pad.py"
   MODEL_DIR="/model-tp${TP}"
 fi
-# Vision tower dims (1024/16/4096/10240) divide by neither 6 nor most odd TPs.
-# Hosting the encoder whole on every rank sidesteps that; vLLM falls back to
-# weight-sharded if the model does not implement encoder DP, which is why
-# probe.py reports whether it does. Set empty to omit the flag entirely.
+# Vision tower dims (1024/16/4096/10240) divide by neither 6 nor most odd TPs,
+# and nothing pads them — hosting the encoder whole on every rank is the only way
+# through. The probe confirmed the tower honours this (tp_size=1 and disable_tp
+# on every vision linear when use_data_parallel is set) but never declares
+# `supports_encoder_tp_data`, so the shim sets that marker; without both the
+# flag and the marker vLLM downgrades to weight-sharding and dies in divide(16,6).
+# Set empty to omit the flag entirely (older vLLM that rejects the option).
 MM_ENCODER_TP_MODE="${GLM53_MM_ENCODER_TP_MODE-data}"
+if [ "$PAD_ACTIVE" = 1 ] && [ -z "$MM_ENCODER_TP_MODE" ]; then
+  printf '\033[33m! GLM53_MM_ENCODER_TP_MODE is empty at TP=%s — the vision tower will\n' "$TP" >&2
+  printf '  shard and assert unless this vLLM defaults to encoder DP.\033[0m\n' >&2
+fi
 
 DRYRUN=0; STOP=0
 for a in "$@"; do
@@ -204,6 +216,7 @@ say "GLM-5.3-Flash FP8 launch: ${NNODES} nodes TP=$TP head=$HEAD:$PORT image=$IM
 say "weights=$WEIGHTS_HOST served-as=$SERVED_NAME lane=$LANE ctx=$MAX_MODEL_LEN seqs=$MAX_NUM_SEQS gmu=$GMU"
 if [ "$PAD_ACTIVE" = 1 ]; then
   say "TP=$TP does not divide the model — padding: ${GLM53_PAD_SUMMARY}"
+  printf '   groups  %s\n' "${GLM53_PAD_GROUPS}"
   printf '   serving %s (config overlay, symlinks to /model)\n' "$MODEL_DIR"
   printf '   lane seq counts were measured at TP=4; re-bench (docs/TP6.md)\n'
 fi
